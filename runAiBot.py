@@ -30,7 +30,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, ElementClickInterceptedException, NoSuchWindowException, ElementNotInteractableException, WebDriverException, StaleElementReferenceException
 
 from config.personals import *
 from config.questions import *
@@ -47,6 +47,10 @@ from modules.ai.deepseekConnections import deepseek_create_client, deepseek_extr
 from modules.ai.geminiConnections import gemini_create_client, gemini_extract_skills, gemini_answer_question
 
 from typing import Literal
+
+import os, certifi
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 
 pyautogui.FAILSAFE = False
@@ -95,6 +99,23 @@ about_company_for_ai = None # TODO extract about company for AI
 ##<
 
 #>
+
+# Safe UI dialogs (fallback to console if Tkinter is unavailable)
+def safe_alert(text: str, title: str = "Info", button: str = "OK"):
+    try:
+        return pyautogui.alert(text=text, title=title, button=button)
+    except Exception:
+        print_lg(f"[ALERT:{title}] {text}")
+        return None
+
+def safe_confirm(text: str, title: str = "Confirm", buttons: list[str] = None):
+    try:
+        return pyautogui.confirm(text, title, buttons or ["OK", "Cancel"])
+    except Exception:
+        print_lg(f"[CONFIRM:{title}] {text}")
+        if buttons:
+            return buttons[0]
+        return "OK"
 
 
 #< Login Functions
@@ -258,7 +279,24 @@ def get_page_info() -> tuple[WebElement | None, int | None]:
     try:
         pagination_element = try_find_by_classes(driver, ["jobs-search-pagination__pages", "artdeco-pagination", "artdeco-pagination__pages"])
         scroll_to_view(driver, pagination_element)
-        current_page = int(pagination_element.find_element(By.XPATH, "//button[contains(@class, 'active')]").text)
+        # Try to determine current page robustly across UI variants
+        current_button = None
+        try:
+            current_button = driver.find_element(By.XPATH, "//li[contains(@class,'active')]/button | //button[contains(@class,'active')] | //li/button[@aria-current='true'] | //button[@aria-current='true']")
+        except Exception:
+            current_button = None
+
+        current_page = None
+        if current_button:
+            text_value = (current_button.text or "").strip()
+            match = re.search(r"\d+", text_value)
+            if match:
+                current_page = int(match.group())
+            else:
+                aria_label = (current_button.get_attribute("aria-label") or "").strip()
+                match = re.search(r"\d+", aria_label)
+                if match:
+                    current_page = int(match.group())
     except Exception as e:
         print_lg("Failed to find Pagination element, hence couldn't scroll till end!")
         pagination_element = None
@@ -266,6 +304,80 @@ def get_page_info() -> tuple[WebElement | None, int | None]:
         print_lg(e)
     return pagination_element, current_page
 
+
+
+def go_to_next_page_safely(current_page: int | None) -> bool:
+    '''
+    Attempts to navigate to the next page using multiple strategies and waits for the page to update.
+    Returns True if navigated, False if no next page found.
+    '''
+    try:
+        prev_active = current_page
+        # Capture current first job id to detect content refresh
+        prev_first_job_id = None
+        try:
+            first_job = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")
+            if first_job:
+                prev_first_job_id = first_job[0].get_dom_attribute('data-occludable-job-id')
+        except Exception:
+            pass
+
+        clicked = False
+        # Strategy 1: Next by page number
+        if current_page is not None:
+            try:
+                btn = driver.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']")
+                scroll_to_view(driver, btn)
+                try:
+                    WebDriverWait(driver, 3).until(EC.element_to_be_clickable(btn))
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                clicked = True
+            except Exception:
+                # Try numeric button text
+                try:
+                    btn = driver.find_element(By.XPATH, f"//ul[contains(@class,'artdeco-pagination__pages')]//button[normalize-space(text())='{current_page+1}']")
+                    scroll_to_view(driver, btn)
+                    driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                except Exception:
+                    pass
+
+        # Strategy 2: 'Next' arrow
+        if not clicked:
+            try:
+                next_btn = driver.find_element(By.XPATH, "//button[@aria-label='Next' and not(@disabled) and not(@aria-disabled='true')]")
+                scroll_to_view(driver, next_btn)
+                try:
+                    WebDriverWait(driver, 3).until(EC.element_to_be_clickable(next_btn))
+                    next_btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", next_btn)
+                clicked = True
+            except Exception:
+                pass
+
+        if not clicked:
+            return False
+
+        # Wait for page to update: active page increment OR first job id changed
+        try:
+            WebDriverWait(driver, 6).until(lambda d: (
+                (lambda cp: (cp is not None and cp == (prev_active + 1 if prev_active is not None else None))) (
+                    get_page_info()[1]
+                )
+            ) or (
+                (lambda fid: fid is not None and fid != prev_first_job_id) (
+                    (d.find_elements(By.XPATH, "//li[@data-occludable-job-id]")[0].get_dom_attribute('data-occludable-job-id') if d.find_elements(By.XPATH, "//li[@data-occludable-job-id]") else None)
+                )
+            ))
+        except Exception:
+            buffer(2)
+        return True
+    except Exception as e:
+        print_lg("Pagination: unexpected failure while navigating to next page", e)
+        return False
 
 
 def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_jobs: set) -> tuple[str, str, str, str, str, bool]:
@@ -279,7 +391,11 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     * work_style: Work style of this job (Remote, On-site, Hybrid)
     * skip: A boolean flag to skip this job
     '''
-    job_details_button = job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
+    try:
+        job_details_button = job.find_element(By.TAG_NAME, 'a')  # job.find_element(By.CLASS_NAME, "job-card-list__title")  # Problem in India
+    except Exception:
+        # Some items may be ads or placeholders; skip gracefully
+        return (job.get_dom_attribute('data-occludable-job-id') or "Unknown", "Unknown", "Unknown", "Unknown", "Unknown", True)
     scroll_to_view(driver, job_details_button, True)
     job_id = job.get_dom_attribute('data-occludable-job-id')
     title = job_details_button.text
@@ -838,7 +954,7 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
         csv_file.close()
     except Exception as e:
         print_lg("Failed to update submitted jobs list!", e)
-        pyautogui.alert("Failed to update the excel of applied jobs!\nProbably because of 1 of the following reasons:\n1. The file is currently open or in use by another program\n2. Permission denied to write to the file\n3. Failed to find the file", "Failed Logging")
+        safe_alert("Failed to update the excel of applied jobs!\nProbably because of 1 of the following reasons:\n1. The file is currently open or in use by another program\n2. Permission denied to write to the file\n3. Failed to find the file", "Failed Logging")
 
 
 
@@ -867,6 +983,11 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         print_lg(f'\n>>>> Now searching for "{searchTerm}" <<<<\n\n')
 
         apply_filters()
+        try:
+            if pause_after_filters and "Turn off Pause after search" == safe_confirm("These are your configured search results and filter. It is safe to change them while this dialog is open, any changes later could result in errors and skipping this search run.", "Please check your results", ["Turn off Pause after search", "Look's good, Continue"]):
+                pause_after_filters = False
+        except Exception:
+            pass
 
         current_count = 0
         try:
@@ -881,12 +1002,23 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                 job_listings = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")  
 
             
-                for job in job_listings:
+                for index in range(len(job_listings)):
                     if keep_screen_awake: pyautogui.press('shiftright')
                     if current_count >= switch_number: break
                     print_lg("\n-@-\n")
-
-                    job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                    # Re-fetch the job element by index to avoid stale references
+                    try:
+                        job = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")[index]
+                    except Exception:
+                        continue
+                    try:
+                        job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                    except StaleElementReferenceException:
+                        try:
+                            job = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")[index]
+                            job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                        except Exception:
+                            continue
                     
                     if skip: continue
                     # Redundant fail safe check for applied jobs!
@@ -918,8 +1050,10 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         skip_count += 1
                         continue
                     except Exception as e:
-                        print_lg("Failed to scroll to About Company!")
+                        print_lg("Failed to scroll to About Company! Skipping this job to avoid errors.")
                         # print_lg(e)
+                        skip_count += 1
+                        continue
 
 
 
@@ -1008,7 +1142,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                     if next_counter >= 15: 
                                         if pause_at_failed_question:
                                             screenshot(driver, job_id, "Needed manual intervention for failed question")
-                                            pyautogui.alert("Couldn't answer one or more questions.\nPlease click \"Continue\" once done.\nDO NOT CLICK Back, Next or Review button in LinkedIn.\n\n\n\n\nYou can turn off \"Pause at failed question\" setting in config.py", "Help Needed", "Continue")
+                                            safe_alert("Couldn't answer one or more questions.\nPlease click \"Continue\" once done.\nDO NOT CLICK Back, Next or Review button in LinkedIn.\n\n\n\n\nYou can turn off \"Pause at failed question\" setting in config.py", "Help Needed", "Continue")
                                             next_counter = 1
                                             continue
                                         if questions_list: print_lg("Stuck for one or some of the following questions...", questions_list)
@@ -1031,7 +1165,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 wait_span_click(driver, "Review", 1, scrollTop=True)
                                 cur_pause_before_submit = pause_before_submit
                                 if errored != "stuck" and cur_pause_before_submit:
-                                    decision = pyautogui.confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
+                                    decision = safe_confirm('1. Please verify your information.\n2. If you edited something, please return to this final screen.\n3. DO NOT CLICK "Submit Application".\n\n\n\n\nYou can turn off "Pause before submit" setting in config.py\nTo TEMPORARILY disable pausing, click "Disable Pause"', "Confirm your information",["Disable Pause", "Discard Application", "Submit Application"])
                                     if decision == "Discard Application": raise Exception("Job application discarded by user!")
                                     pause_before_submit = False if "Disable Pause" == decision else True
                                     # try_xp(modal, ".//span[normalize-space(.)='Review']")
@@ -1039,7 +1173,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 if wait_span_click(driver, "Submit application", 2, scrollTop=True): 
                                     date_applied = datetime.now()
                                     if not wait_span_click(driver, "Done", 2): actions.send_keys(Keys.ESCAPE).perform()
-                                elif errored != "stuck" and cur_pause_before_submit and "Yes" in pyautogui.confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):
+                                elif errored != "stuck" and cur_pause_before_submit and "Yes" in safe_confirm("You submitted the application, didn't you 😒?", "Failed to find Submit Application!", ["Yes", "No"]):
                                     date_applied = datetime.now()
                                     wait_span_click(driver, "Done", 2)
                                 else:
@@ -1081,10 +1215,13 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     print_lg("Couldn't find pagination element, probably at the end page of results!")
                     break
                 try:
-                    pagination_element.find_element(By.XPATH, f"//button[@aria-label='Page {current_page+1}']").click()
-                    print_lg(f"\n>-> Now on Page {current_page+1} \n")
-                except NoSuchElementException:
-                    print_lg(f"\n>-> Didn't find Page {current_page+1}. Probably at the end page of results!\n")
+                    if go_to_next_page_safely(current_page):
+                        print_lg(f"\n>-> Attempted to navigate from page {current_page if current_page is not None else '?'} -> next \n")
+                    else:
+                        print_lg(f"\n>-> Didn't find next page. Probably at the end page of results!\n")
+                        break
+                except Exception as e:
+                    print_lg("\n>-> Pagination navigation failed unexpectedly!\n", e)
                     break
 
         except (NoSuchWindowException, WebDriverException) as e:
@@ -1130,7 +1267,7 @@ def main() -> None:
         validate_config()
         
         if not os.path.exists(default_resume_path):
-            pyautogui.alert(text='Your default resume "{}" is missing! Please update it\'s folder path "default_resume_path" in config.py\n\nOR\n\nAdd a resume with exact name and path (check for spelling mistakes including cases).\n\n\nFor now the bot will continue using your previous upload from LinkedIn!'.format(default_resume_path), title="Missing Resume", button="OK")
+            safe_alert(text='Your default resume "{}" is missing! Please update it\'s folder path "default_resume_path" in config.py\n\nOR\n\nAdd a resume with exact name and path (check for spelling mistakes including cases).\n\n\nFor now the bot will continue using your previous upload from LinkedIn!'.format(default_resume_path), title="Missing Resume", button="OK")
             useNewResume = False
         
         # Login to LinkedIn
@@ -1190,7 +1327,7 @@ def main() -> None:
         print_lg("Browser window closed or session is invalid. Exiting.", e)
     except Exception as e:
         critical_error_log("In Applier Main", e)
-        pyautogui.alert(e,alert_title)
+        safe_alert(str(e),alert_title)
     finally:
         print_lg("\n\nTotal runs:                     {}".format(total_runs))
         print_lg("Jobs Easy Applied:              {}".format(easy_applied_count))
